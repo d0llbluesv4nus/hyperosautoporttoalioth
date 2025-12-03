@@ -1,4 +1,4 @@
-name: Build HyperOS SGSI (Fix Read-Only)
+name: Build HyperOS SGSI (Final Fix)
 
 on:
   workflow_dispatch:
@@ -41,7 +41,7 @@ jobs:
           
           sudo ln -sf /usr/bin/python2 /usr/bin/python
 
-      # 3. Установка инструментов (включая erofs-utils)
+      # 3. Установка инструментов
       - name: Установка системных инструментов
         run: |
           sudo apt-get install -y git wget curl unzip tar zip android-sdk-libsparse-utils e2fsprogs simg2img img2simg aria2 brotli erofs-utils
@@ -67,12 +67,12 @@ jobs:
           echo "Запуск make.sh..."
           sudo bash make.sh --AB 14 tmp/firmware.zip --fix-bug
 
-      # 7. ПАТЧИНГ (ПОЛНОСТЬЮ ПЕРЕПИСАННЫЙ ШАГ)
+      # 7. ПАТЧИНГ (С исправлениями прав доступа)
       - name: Патчинг и Перепаковка для Poco F3
         run: |
           cd SGSI-build-tool
           
-          # Ищем исходный образ
+          # Ищем образ
           IMG_FILE=$(find . -name "*system*.img" | grep -v "mount_point" | head -n 1)
           
           if [ ! -f "$IMG_FILE" ]; then
@@ -81,42 +81,39 @@ jobs:
           fi
           echo "Найден образ: $IMG_FILE"
 
-          # 1. Конвертация в RAW (если нужно)
+          # Конвертация sparse -> raw (если нужно)
           if file "$IMG_FILE" | grep -q "Android sparse image"; then
              echo "Конвертация sparse -> raw..."
              simg2img "$IMG_FILE" system_raw.img
-             rm "$IMG_FILE"
+             # ИСПРАВЛЕНИЕ: Удаляем файл через sudo, так как он создан от root
+             sudo rm -f "$IMG_FILE"
              mv system_raw.img "$IMG_FILE"
           fi
 
-          # 2. Распаковка образа в папку (чтобы можно было редактировать)
+          # Распаковка
           echo "Распаковка содержимого образа..."
           mkdir -p mount_point
           mkdir -p extracted_root
           
-          # Монтируем только для чтения
           sudo mount -o loop "$IMG_FILE" mount_point
-          # Копируем всё содержимое в папку extracted_root (сохраняя права доступа)
           sudo cp -a mount_point/* extracted_root/
           sudo umount mount_point
           
-          # Удаляем старый образ, он больше не нужен
-          rm "$IMG_FILE"
+          # ИСПРАВЛЕНИЕ: Удаляем исходный файл через sudo
+          sudo rm -f "$IMG_FILE"
 
-          echo "Применение патчей в папке extracted_root..."
-          
-          # --- ПАТЧИ ---
+          echo "Применение патчей..."
           
           # Fix 1: Build.prop
           sudo sed -i 's/ro.secure=1/ro.secure=0/g' extracted_root/system/build.prop || true
           sudo sed -i 's/ro.adb.secure=1/ro.adb.secure=0/g' extracted_root/system/build.prop || true
           sudo sed -i 's/ro.debuggable=0/ro.debuggable=1/g' extracted_root/system/build.prop || true
           
-          # Fix 2: Удаление оверлеев (критично для F3)
+          # Fix 2: Оверлеи
           sudo rm -rf extracted_root/product/overlay/DeviceConfig*.apk || true
           sudo rm -rf extracted_root/product/overlay/*MiuiSystemUI*.apk || true
           
-          # Fix 3: Fstab (отключение шифрования)
+          # Fix 3: Fstab
           FSTAB_FILE=$(find extracted_root/system -name "fstab*" | head -n 1)
           if [ -f "$FSTAB_FILE" ]; then
              echo "Патчим fstab: $FSTAB_FILE"
@@ -126,14 +123,17 @@ jobs:
              sudo sed -i 's/dm-verity//g' "$FSTAB_FILE"
           fi
           
-          # ----------------
-          
           echo "Упаковка обратно в EROFS..."
-          # Собираем новый образ из папки. Используем сжатие lz4hc (стандарт для Xiaomi)
+          # Сборка нового образа
           sudo mkfs.erofs -zLZ4HC system_patched.img extracted_root/
           
-          # Удаляем временную папку
+          # ИСПРАВЛЕНИЕ: Меняем владельца файла на текущего пользователя runner,
+          # чтобы GitHub Actions мог его прочитать и загрузить
+          sudo chown $(whoami) system_patched.img
+          
+          # Очистка мусора
           sudo rm -rf extracted_root
+          sudo rm -rf mount_point
 
       # 8. Релиз
       - name: Упаковка и Релиз
@@ -146,7 +146,9 @@ jobs:
           body: |
             HyperOS Port for Poco F3 (Alioth).
             **Тип:** EROFS (Read-Only System).
-            **Установка:** Прошить в System Image, сделать Format Data.
+            **Установка:** 
+            1. Прошить `system_patched.img` в раздел System Image.
+            2. Сделать Format Data.
             Source: ${{ github.event.inputs.rom_url }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

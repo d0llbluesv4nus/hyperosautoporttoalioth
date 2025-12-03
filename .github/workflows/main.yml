@@ -1,4 +1,4 @@
-name: Build HyperOS SGSI (Fix Headers)
+name: Build HyperOS SGSI (Fix Read-Only)
 
 on:
   workflow_dispatch:
@@ -27,30 +27,21 @@ jobs:
           sudo apt-get clean
           df -h
 
-      # 2. Установка Python 2 и зависимостей (ГЛАВНОЕ ИСПРАВЛЕНИЕ)
+      # 2. Установка Python 2 и зависимостей
       - name: Установка окружения Python 2.7
         run: |
           sudo add-apt-repository universe
           sudo apt-get update
-          
-          # ИСПРАВЛЕНИЕ: Добавлен python2-dev для файла Python.h
           sudo apt-get install -y python2 python2-dev liblzma-dev
           
-          # Скачиваем pip
           curl https://bootstrap.pypa.io/pip/2.7/get-pip.py --output get-pip.py
           sudo python2 get-pip.py
           
-          # Устанавливаем библиотеки (Теперь компиляция backports.lzma пройдет успешно)
           sudo python2 -m pip install protobuf==3.17.3 backports.lzma
           
-          # Симлинк
           sudo ln -sf /usr/bin/python2 /usr/bin/python
-          
-          # Проверка
-          echo "Проверка LZMA:"
-          python2 -c "from backports import lzma; print lzma.__file__"
 
-      # 3. Установка инструментов
+      # 3. Установка инструментов (включая erofs-utils)
       - name: Установка системных инструментов
         run: |
           sudo apt-get install -y git wget curl unzip tar zip android-sdk-libsparse-utils e2fsprogs simg2img img2simg aria2 brotli erofs-utils
@@ -76,46 +67,73 @@ jobs:
           echo "Запуск make.sh..."
           sudo bash make.sh --AB 14 tmp/firmware.zip --fix-bug
 
-      # 7. ПАТЧИНГ (Alioth Specific)
-      - name: Патчинг образа для Poco F3
+      # 7. ПАТЧИНГ (ПОЛНОСТЬЮ ПЕРЕПИСАННЫЙ ШАГ)
+      - name: Патчинг и Перепаковка для Poco F3
         run: |
           cd SGSI-build-tool
-          mkdir -p mount_point
           
+          # Ищем исходный образ
           IMG_FILE=$(find . -name "*system*.img" | grep -v "mount_point" | head -n 1)
           
           if [ ! -f "$IMG_FILE" ]; then
             echo "ОШИБКА: Образ не найден! Сборка не удалась."
             exit 1
           fi
+          echo "Найден образ: $IMG_FILE"
 
+          # 1. Конвертация в RAW (если нужно)
           if file "$IMG_FILE" | grep -q "Android sparse image"; then
+             echo "Конвертация sparse -> raw..."
              simg2img "$IMG_FILE" system_raw.img
              rm "$IMG_FILE"
              mv system_raw.img "$IMG_FILE"
           fi
 
-          sudo mount -o loop,rw "$IMG_FILE" mount_point
+          # 2. Распаковка образа в папку (чтобы можно было редактировать)
+          echo "Распаковка содержимого образа..."
+          mkdir -p mount_point
+          mkdir -p extracted_root
           
-          echo ">>> Применение патчей..."
-          sudo sed -i 's/ro.secure=1/ro.secure=0/g' mount_point/system/build.prop || true
-          sudo sed -i 's/ro.adb.secure=1/ro.adb.secure=0/g' mount_point/system/build.prop || true
-          sudo sed -i 's/ro.debuggable=0/ro.debuggable=1/g' mount_point/system/build.prop || true
+          # Монтируем только для чтения
+          sudo mount -o loop "$IMG_FILE" mount_point
+          # Копируем всё содержимое в папку extracted_root (сохраняя права доступа)
+          sudo cp -a mount_point/* extracted_root/
+          sudo umount mount_point
           
-          sudo rm -rf mount_point/product/overlay/DeviceConfig*.apk || true
-          sudo rm -rf mount_point/product/overlay/*MiuiSystemUI*.apk || true
+          # Удаляем старый образ, он больше не нужен
+          rm "$IMG_FILE"
+
+          echo "Применение патчей в папке extracted_root..."
           
-          FSTAB_FILE=$(find mount_point/system -name "fstab*" | head -n 1)
+          # --- ПАТЧИ ---
+          
+          # Fix 1: Build.prop
+          sudo sed -i 's/ro.secure=1/ro.secure=0/g' extracted_root/system/build.prop || true
+          sudo sed -i 's/ro.adb.secure=1/ro.adb.secure=0/g' extracted_root/system/build.prop || true
+          sudo sed -i 's/ro.debuggable=0/ro.debuggable=1/g' extracted_root/system/build.prop || true
+          
+          # Fix 2: Удаление оверлеев (критично для F3)
+          sudo rm -rf extracted_root/product/overlay/DeviceConfig*.apk || true
+          sudo rm -rf extracted_root/product/overlay/*MiuiSystemUI*.apk || true
+          
+          # Fix 3: Fstab (отключение шифрования)
+          FSTAB_FILE=$(find extracted_root/system -name "fstab*" | head -n 1)
           if [ -f "$FSTAB_FILE" ]; then
+             echo "Патчим fstab: $FSTAB_FILE"
              sudo sed -i 's/,fileencryption=aes-256-xts:aes-256-cts:v2//g' "$FSTAB_FILE"
              sudo sed -i 's/,avb//g' "$FSTAB_FILE"
              sudo sed -i 's/forceencrypt//g' "$FSTAB_FILE"
              sudo sed -i 's/dm-verity//g' "$FSTAB_FILE"
           fi
           
-          sudo umount mount_point
-          img2simg "$IMG_FILE" system_patched.img
-          rm "$IMG_FILE"
+          # ----------------
+          
+          echo "Упаковка обратно в EROFS..."
+          # Собираем новый образ из папки. Используем сжатие lz4hc (стандарт для Xiaomi)
+          sudo mkfs.erofs -zLZ4HC system_patched.img extracted_root/
+          
+          # Удаляем временную папку
+          sudo rm -rf extracted_root
 
       # 8. Релиз
       - name: Упаковка и Релиз
@@ -127,7 +145,8 @@ jobs:
           name: HyperOS Port Build ${{ github.run_number }}
           body: |
             HyperOS Port for Poco F3 (Alioth).
-            **ВНИМАНИЕ:** Файл .img загружен напрямую.
+            **Тип:** EROFS (Read-Only System).
+            **Установка:** Прошить в System Image, сделать Format Data.
             Source: ${{ github.event.inputs.rom_url }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

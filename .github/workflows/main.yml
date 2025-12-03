@@ -1,4 +1,4 @@
-name: Build HyperOS SGSI for Poco F3 (Fixed Args)
+name: Build HyperOS SGSI & Release
 
 on:
   workflow_dispatch:
@@ -11,6 +11,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    # ОЧЕНЬ ВАЖНО: Права на запись для создания релизов
     permissions:
       contents: write
     
@@ -31,7 +32,7 @@ jobs:
       - name: Установка инструментов
         run: |
           sudo apt-get update
-          sudo apt-get install -y git wget curl unzip tar android-sdk-libsparse-utils e2fsprogs simg2img img2simg python3 python3-pip aria2 brotli erofs-utils
+          sudo apt-get install -y git wget curl unzip tar zip android-sdk-libsparse-utils e2fsprogs simg2img img2simg python3 python3-pip aria2 brotli erofs-utils
           pip3 install protobuf==3.20.*
 
       # 3. Клонирование (ветка 12)
@@ -40,7 +41,7 @@ jobs:
           git clone --recurse-submodules https://github.com/Xiaoxindada/SGSI-build-tool.git -b 12
           sudo chmod -R 777 SGSI-build-tool
 
-      # 4. Скачивание (В папку TMP)
+      # 4. Скачивание
       - name: Скачивание прошивки
         run: |
           cd SGSI-build-tool
@@ -48,16 +49,34 @@ jobs:
           echo "Скачивание в папку tmp..."
           aria2c -x16 -s16 -o tmp/firmware.zip "${{ github.event.inputs.rom_url }}"
 
-      # 5. Сборка (ИСПРАВЛЕНА КОМАНДА)
+      # 5. Сборка
       - name: Сборка SGSI
         run: |
           cd SGSI-build-tool
-          
-          # Запуск настройки окружения скрипта (на всякий случай)
           sudo bash setup.sh
-
           echo "Начинаем сборку..."
-          # --- ИСПРАВЛЕНИЕ ---
-          # Формат: make.sh <Тип> <Версия> <Путь> <Доп.опции>
-          # --AB: Тип разметки для Poco F3
-          # 14: Версия Android (HyperOS 1.0
+          # --AB: Тип разделов, 14: Android 14
+          sudo bash make.sh --AB 14 tmp/firmware.zip --fix-bug
+
+      # 6. ПАТЧИНГ
+      - name: Патчинг образа
+        run: |
+          cd SGSI-build-tool
+          mkdir -p mount_point
+          
+          IMG_FILE=$(find . -name "*system*.img" | grep -v "mount_point" | head -n 1)
+          
+          if [ ! -f "$IMG_FILE" ]; then
+            echo "ОШИБКА: Образ не найден!"
+            exit 1
+          fi
+
+          if file "$IMG_FILE" | grep -q "Android sparse image"; then
+             simg2img "$IMG_FILE" system_raw.img
+             rm "$IMG_FILE"
+             mv system_raw.img "$IMG_FILE"
+          fi
+
+          sudo mount -o loop,rw "$IMG_FILE" mount_point
+          
+          ech

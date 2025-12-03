@@ -1,16 +1,12 @@
-name: Build HyperOS SGSI for Poco F3 (Manual Clean)
+name: Build HyperOS SGSI for Poco F3 (Fixed Branch)
 
 on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: 'Прямая ссылка на Recovery ROM HyperOS (Source Device)'
+        description: 'Прямая ссылка на Recovery ROM HyperOS (Source)'
         required: true
         default: ''
-      os_type:
-        description: 'Версия Android (14 или 15)'
-        required: true
-        default: '14'
 
 jobs:
   build:
@@ -22,106 +18,106 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # --- ИСПРАВЛЕНИЕ: РУЧНАЯ ОЧИСТКА МЕСТА ---
-      # Мы не используем сторонние экшены, удаляем лишнее сами.
-      # Это освободит около 20 ГБ места.
-      - name: Ручная очистка места (Manual Cleanup)
+      # 1. Очистка места (Ручная, самая надежная)
+      - name: Ручная очистка места
         run: |
-          echo "Очистка места на диске..."
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/share/swift
-          sudo docker rmi $(docker images -q) 2>/dev/null || true
           sudo apt-get clean
-          echo "Очистка завершена. Свободное место:"
           df -h
-      # -----------------------------------------
 
-      - name: Установка зависимостей
+      # 2. Установка зависимостей
+      - name: Установка инструментов
         run: |
           sudo apt-get update
           sudo apt-get install -y git wget curl unzip tar android-sdk-libsparse-utils e2fsprogs simg2img img2simg python3 python3-pip aria2 brotli
           pip3 install protobuf==3.20.*
 
-      - name: Настройка SGSI Tool (Xiaoxindada)
+      # 3. Настройка SGSI Tool (ИСПРАВЛЕНО: Ветка 14 вместо 15)
+      - name: Настройка SGSI Tool
         run: |
-          # Ветка 15 для Android 14/15
-          git clone --recurse-submodules https://github.com/Xiaoxindada/SGSI-build-tool.git -b 15
+          # Используем ветку 14. Она подходит для HyperOS (Android 14) и новее.
+          git clone --recurse-submodules https://github.com/Xiaoxindada/SGSI-build-tool.git -b 14
           sudo chmod -R 777 SGSI-build-tool
 
+      # 4. Скачивание
       - name: Скачивание прошивки
         run: |
           cd SGSI-build-tool
-          echo "Скачивание прошивки..."
+          echo "Скачивание..."
           aria2c -x16 -s16 -o firmware.zip "${{ github.event.inputs.rom_url }}"
-          
-      - name: Сборка образа (Build SGSI)
+
+      # 5. Сборка (Unpack + Make)
+      - name: Сборка SGSI
         run: |
           cd SGSI-build-tool
-          
-          # 1. Распаковка
           ./unpack.sh firmware.zip
           
-          # 2. Сборка (AB - так как Poco F3 это AB устройство)
+          # Собираем образ. Скрипт сам определит, AB это или A-only.
+          # Для Poco F3 лучше всего работает AB.
           sudo ./make.sh AB
-          
-      - name: ПРИМЕНЕНИЕ ПАТЧЕЙ (Fixes for Alioth)
+
+      # 6. КРИТИЧЕСКИЕ ПАТЧИ ДЛЯ ЗАПУСКА
+      - name: Патчинг образа (Fix Boot)
         run: |
           cd SGSI-build-tool
           mkdir -p mount_point
           
-          # Ищем готовый образ
-          IMG_FILE=$(find . -name "*system*.img" | head -n 1)
+          # Ищем system.img (имя может отличаться после сборки)
+          IMG_FILE=$(find . -name "Wait_flash_system.img" -o -name "*system*.img" | head -n 1)
           
-          if [ -f "$IMG_FILE" ]; then
-            echo "Образ найден: $IMG_FILE. Начинаем патчинг..."
-            
-            # Если образ в sparse формате, конвертируем в raw для монтирования
-            if file "$IMG_FILE" | grep -q "Android sparse image"; then
-                simg2img "$IMG_FILE" system_raw.img
-                rm "$IMG_FILE"
-                mv system_raw.img "$IMG_FILE"
-            fi
-            
-            # Монтируем
-            sudo mount -o loop,rw "$IMG_FILE" mount_point
-            
-            echo ">>> [PATCH 1] Отключение Secure Boot и включение Debuggable"
-            # Это критично для отладки бутлупов
-            sudo sed -i 's/ro.secure=1/ro.secure=0/g' mount_point/system/build.prop || true
-            sudo sed -i 's/ro.debuggable=0/ro.debuggable=1/g' mount_point/system/build.prop || true
-            sudo sed -i 's/ro.adb.secure=1/ro.adb.secure=0/g' mount_point/system/build.prop || true
-            
-            echo ">>> [PATCH 2] Удаление оверлеев (DeviceConfig)"
-            # Удаляем специфичные конфиги донора, чтобы не ломать интерфейс Poco F3
-            sudo rm -rf mount_point/product/overlay/DeviceConfig*.apk || true
-            
-            echo ">>> [PATCH 3] Отключение шифрования (fstab)"
-            if [ -f mount_point/system/etc/fstab* ]; then
-                sudo sed -i 's/fileencryption//g' mount_point/system/etc/fstab*
-                sudo sed -i 's/forceencrypt//g' mount_point/system/etc/fstab*
-                sudo sed -i 's/dm-verity//g' mount_point/system/etc/fstab*
-            fi
-            
-            # Удаление сервисов, часто вызывающих сбои на портах
-            echo ">>> [PATCH 4] Удаление MiTrustService (опционально)"
-            sudo rm -rf mount_point/system/app/MiTrustService || true
-
-            sudo umount mount_point
-            echo "Патчи применены."
-            
-            # Сжимаем обратно в sparse для быстрой загрузки и прошивки
-            img2simg "$IMG_FILE" system_patched.img
-            rm "$IMG_FILE"
-          else
-            echo "ERROR: System image not found! Сборка не удалась."
+          if [ ! -f "$IMG_FILE" ]; then
+            echo "ОШИБКА: Файл образа не создан!"
+            ls -R
             exit 1
           fi
 
-      - name: Упаковка и загрузка
+          echo "Образ найден: $IMG_FILE"
+          
+          # Если sparse - конвертируем
+          if file "$IMG_FILE" | grep -q "Android sparse image"; then
+             simg2img "$IMG_FILE" system_raw.img
+             rm "$IMG_FILE"
+             mv system_raw.img "$IMG_FILE"
+          fi
+
+          # Монтируем
+          sudo mount -o loop,rw "$IMG_FILE" mount_point
+          
+          echo ">>> 1. Отключение Secure Boot (чтобы видеть логи при бутлупе)"
+          sudo sed -i 's/ro.secure=1/ro.secure=0/g' mount_point/system/build.prop || true
+          sudo sed -i 's/ro.adb.secure=1/ro.adb.secure=0/g' mount_point/system/build.prop || true
+          sudo sed -i 's/ro.debuggable=0/ro.debuggable=1/g' mount_point/system/build.prop || true
+
+          echo ">>> 2. Удаление конфликтующих оверлеев"
+          # Удаляем оверлеи донора. Система подхватит оверлеи из твоего Vendor раздела.
+          sudo rm -rf mount_point/product/overlay/DeviceConfig*.apk || true
+          # Удаляем специфичные для донора фреймворк-патчи
+          sudo rm -rf mount_point/system/framework/MiuiBooster.jar || true
+          
+          echo ">>> 3. Фикс fstab (шифрование)"
+          # Если fstab есть в system (в новых Android он часто в vendor_boot, но проверим)
+          if [ -f mount_point/system/etc/fstab* ]; then
+            sudo sed -i 's/,fileencryption=aes-256-xts:aes-256-cts:v2//g' mount_point/system/etc/fstab*
+            sudo sed -i 's/,avb//g' mount_point/system/etc/fstab*
+            sudo sed -i 's/forceencrypt//g' mount_point/system/etc/fstab*
+          fi
+          
+          echo ">>> 4. Удаление сервисов Xiaomi, ломающих порты"
+          sudo rm -rf mount_point/system/app/MiTrustService || true
+          sudo rm -rf mount_point/system/priv-app/MiTrustService || true
+          
+          # Размонтирование
+          sudo umount mount_point
+          
+          # Конвертация обратно в Sparse (меньше размер)
+          img2simg "$IMG_FILE" system_patched.img
+          rm "$IMG_FILE"
+
+      - name: Загрузка результата
         uses: actions/upload-artifact@v4
         with:
-          name: HyperOS-Alioth-Port
+          name: HyperOS-Port-Alioth
           path: SGSI-build-tool/system_patched.img
           compression-level: 9

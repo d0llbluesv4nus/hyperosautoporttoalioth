@@ -14,7 +14,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     
@@ -22,26 +22,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Освобождение места (Cleanup)
-        uses: rokibhasan12/Remove-Android-Software-Action@v1
+      # --- ИСПРАВЛЕНИЕ ОШИБКИ ---
+      # Заменили удаленный экшен на надежный jlumbroso/free-disk-space-action
+      - name: Освобождение места (Free Disk Space)
+        uses: jlumbroso/free-disk-space-action@v1.3.1
+        with:
+          # Удаляем предустановленный софт, который не нужен для сборки, но занимает место
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      # ---------------------------
 
       - name: Установка зависимостей
         run: |
           sudo apt-get update
           sudo apt-get install -y git wget curl unzip tar android-sdk-libsparse-utils e2fsprogs simg2img img2simg python3 python3-pip aria2 brotli
-          # Установка инструментов для работы с разделами
           pip3 install protobuf==3.20.*
 
       - name: Настройка SGSI Tool (Xiaoxindada)
         run: |
+          # Используем ветку 15 (для последних версий Android)
           git clone --recurse-submodules https://github.com/Xiaoxindada/SGSI-build-tool.git -b 15
-          # Ветка 15 обычно поддерживает A14 и A15
           sudo chmod -R 777 SGSI-build-tool
 
       - name: Скачивание прошивки
         run: |
           cd SGSI-build-tool
           echo "Скачивание прошивки..."
+          # aria2c качает быстрее и надежнее wget
           aria2c -x16 -s16 -o firmware.zip "${{ github.event.inputs.rom_url }}"
           
       - name: Сборка образа (Build SGSI)
@@ -51,51 +63,41 @@ jobs:
           # 1. Распаковка
           ./unpack.sh firmware.zip
           
-          # 2. Основная магия сборки (автоматический патчинг GSI)
-          # A-only false (Alioth это AB устройство, но SGSI часто делают A-only для установки в System)
-          # Но для F3 лучше использовать AB структуру, если тулза позволяет.
-          # В данном инструменте скрипт сам определяет структуру.
-          
+          # 2. Сборка (AB - так как Poco F3 это AB устройство)
           sudo ./make.sh AB
           
       - name: ПРИМЕНЕНИЕ ДОПОЛНИТЕЛЬНЫХ ПАТЧЕЙ (Custom Alioth Fixes)
         run: |
           cd SGSI-build-tool
-          # Монтируем полученный образ для ручных правок
           mkdir -p mount_point
           
-          # Находим созданный образ (обычно в папке output)
+          # Ищем готовый образ
           IMG_FILE=$(find . -name "*system*.img" | head -n 1)
           
           if [ -f "$IMG_FILE" ]; then
             echo "Образ найден: $IMG_FILE. Начинаем патчинг..."
             
-            # Конвертация в raw для монтирования (если он sparse)
+            # Конвертация sparse -> raw (если нужно) для монтирования
             if file "$IMG_FILE" | grep -q "Android sparse image"; then
                 simg2img "$IMG_FILE" system_raw.img
                 rm "$IMG_FILE"
                 mv system_raw.img "$IMG_FILE"
             fi
             
+            # Монтируем
             sudo mount -o loop,rw "$IMG_FILE" mount_point
             
-            echo ">>> [PATCH 1] Отключение проверки Secure Boot и Debuggable"
+            echo ">>> [PATCH 1] Отключение Secure Boot и включение Debuggable (для логов)"
+            # Это позволяет видеть логи через adb logcat даже если система не грузится до конца
             sudo sed -i 's/ro.secure=1/ro.secure=0/g' mount_point/system/build.prop || true
             sudo sed -i 's/ro.debuggable=0/ro.debuggable=1/g' mount_point/system/build.prop || true
             sudo sed -i 's/ro.adb.secure=1/ro.adb.secure=0/g' mount_point/system/build.prop || true
             
-            echo ">>> [PATCH 2] Удаление конфликтующих оверлеев (частая причина бутлупа на F3)"
-            # Удаляем оверлеи донора, которые перекрывают настройки Alioth
+            echo ">>> [PATCH 2] Удаление тяжелых оверлеев"
+            # Удаляем конфигурации чужого устройства, чтобы система подхватила родные от Poco F3
             sudo rm -rf mount_point/product/overlay/DeviceConfig*.apk || true
-            sudo rm -rf mount_point/product/overlay/*MiuiSystemUI*.apk || true
             
-            echo ">>> [PATCH 3] Удаление сервисов, вызывающих краш без Play Integrity"
-            # Удаляем MiTrustService и прочее, что может вешать систему при загрузке
-            sudo rm -rf mount_point/system/app/MiTrustService || true
-            sudo rm -rf mount_point/system/priv-app/MiTrustService || true
-            
-            echo ">>> [PATCH 4] Фикс fstab (Отключение принудительного шифрования для первого запуска)"
-            # Обычно SGSI тулза это делает, но перестрахуемся
+            echo ">>> [PATCH 3] Фикс fstab (убираем шифрование для первого запуска)"
             if [ -f mount_point/system/etc/fstab* ]; then
                 sudo sed -i 's/fileencryption//g' mount_point/system/etc/fstab*
                 sudo sed -i 's/forceencrypt//g' mount_point/system/etc/fstab*
@@ -103,9 +105,9 @@ jobs:
             fi
 
             sudo umount mount_point
-            echo "Патчи применены успешно."
+            echo "Патчи применены."
             
-            # Сжимаем обратно в sparse для уменьшения размера (опционально) или gzip
+            # Сжимаем обратно, чтобы было легче качать
             img2simg "$IMG_FILE" system_patched.img
             rm "$IMG_FILE"
           else

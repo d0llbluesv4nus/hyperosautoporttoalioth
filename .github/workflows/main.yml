@@ -1,4 +1,4 @@
-name: Build HyperOS SGSI (Final Fix)
+name: Build HyperOS SGSI (Fix Compressor)
 
 on:
   workflow_dispatch:
@@ -67,7 +67,7 @@ jobs:
           echo "Запуск make.sh..."
           sudo bash make.sh --AB 14 tmp/firmware.zip --fix-bug
 
-      # 7. ПАТЧИНГ (С исправлениями прав доступа)
+      # 7. ПАТЧИНГ (ИСПРАВЛЕНЫ ОШИБКИ MKFS И FIND)
       - name: Патчинг и Перепаковка для Poco F3
         run: |
           cd SGSI-build-tool
@@ -81,11 +81,10 @@ jobs:
           fi
           echo "Найден образ: $IMG_FILE"
 
-          # Конвертация sparse -> raw (если нужно)
+          # Конвертация sparse -> raw
           if file "$IMG_FILE" | grep -q "Android sparse image"; then
              echo "Конвертация sparse -> raw..."
              simg2img "$IMG_FILE" system_raw.img
-             # ИСПРАВЛЕНИЕ: Удаляем файл через sudo, так как он создан от root
              sudo rm -f "$IMG_FILE"
              mv system_raw.img "$IMG_FILE"
           fi
@@ -96,10 +95,11 @@ jobs:
           mkdir -p extracted_root
           
           sudo mount -o loop "$IMG_FILE" mount_point
+          # Копируем с сохранением прав
           sudo cp -a mount_point/* extracted_root/
           sudo umount mount_point
           
-          # ИСПРАВЛЕНИЕ: Удаляем исходный файл через sudo
+          # Удаляем исходник
           sudo rm -f "$IMG_FILE"
 
           echo "Применение патчей..."
@@ -113,25 +113,26 @@ jobs:
           sudo rm -rf extracted_root/product/overlay/DeviceConfig*.apk || true
           sudo rm -rf extracted_root/product/overlay/*MiuiSystemUI*.apk || true
           
-          # Fix 3: Fstab
-          FSTAB_FILE=$(find extracted_root/system -name "fstab*" | head -n 1)
-          if [ -f "$FSTAB_FILE" ]; then
+          # Fix 3: Fstab (ИСПРАВЛЕНО: добавлено sudo find)
+          FSTAB_FILE=$(sudo find extracted_root/system -name "fstab*" | head -n 1)
+          if [ -n "$FSTAB_FILE" ]; then
              echo "Патчим fstab: $FSTAB_FILE"
              sudo sed -i 's/,fileencryption=aes-256-xts:aes-256-cts:v2//g' "$FSTAB_FILE"
              sudo sed -i 's/,avb//g' "$FSTAB_FILE"
              sudo sed -i 's/forceencrypt//g' "$FSTAB_FILE"
              sudo sed -i 's/dm-verity//g' "$FSTAB_FILE"
+          else
+             echo "WARNING: fstab не найден!"
           fi
           
           echo "Упаковка обратно в EROFS..."
-          # Сборка нового образа
-          sudo mkfs.erofs -zLZ4HC system_patched.img extracted_root/
+          # ИСПРАВЛЕНИЕ: Используем стандартный lz4 вместо LZ4HC
+          sudo mkfs.erofs -zlz4 system_patched.img extracted_root/
           
-          # ИСПРАВЛЕНИЕ: Меняем владельца файла на текущего пользователя runner,
-          # чтобы GitHub Actions мог его прочитать и загрузить
+          # Меняем владельца для загрузки
           sudo chown $(whoami) system_patched.img
           
-          # Очистка мусора
+          # Чистка
           sudo rm -rf extracted_root
           sudo rm -rf mount_point
 
@@ -145,8 +146,9 @@ jobs:
           name: HyperOS Port Build ${{ github.run_number }}
           body: |
             HyperOS Port for Poco F3 (Alioth).
-            **Тип:** EROFS (Read-Only System).
-            **Установка:** 
+            **Тип:** EROFS (Read-Only).
+            **Сжатие:** LZ4.
+            **Установка:**
             1. Прошить `system_patched.img` в раздел System Image.
             2. Сделать Format Data.
             Source: ${{ github.event.inputs.rom_url }}

@@ -1,0 +1,94 @@
+name: Port ROM for Poco F3 (Based on Video)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: 'URL Базовой прошивки (MIUI/HyperOS Alioth)'
+        required: true
+      port_url:
+        description: 'URL Портируемой прошивки (Donor ROM)'
+        required: true
+      rom_name:
+        description: 'Имя архива'
+        default: 'HyperOS_Port_Alioth'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cleanup Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git aria2 python3 python3-pip zip unzip p7zip-full tar zstd
+          # Установка инструментов для работы с образами (payload dumper, erofs, etc)
+          pip3 install --upgrade pip
+          pip3 install protobuf==3.20.*
+          
+          # Установка payload-dumper-go
+          wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          tar -xvf payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          sudo mv payload-dumper-go /usr/local/bin/
+          
+          # Установка erofs-utils (для HyperOS/новых MIUI)
+          sudo apt-get install -y erofs-utils
+
+      - name: Download & Extract ROMs
+        run: |
+          mkdir -p input/base input/port
+          
+          echo "Downloading Base..."
+          aria2c -x16 -s16 -d input/base -o base.zip "${{ inputs.base_url }}"
+          
+          echo "Downloading Port..."
+          aria2c -x16 -s16 -d input/port -o port.zip "${{ inputs.port_url }}"
+          
+          # Распаковка Base
+          echo "Extracting Base..."
+          unzip input/base/base.zip -d input/base/
+          if [ -f input/base/payload.bin ]; then
+            payload-dumper-go -o workspace/base input/base/payload.bin
+          else
+            echo "Support currently for Recovery ROMs (payload.bin) mainly. Trying manual unzip..."
+            unzip input/base/base.zip -d workspace/base
+          fi
+
+          # Распаковка Port
+          echo "Extracting Port..."
+          unzip input/port/port.zip -d input/port/
+          if [ -f input/port/payload.bin ]; then
+            payload-dumper-go -o workspace/port input/port/payload.bin
+          fi
+
+      - name: Run Porting Script
+        run: |
+          chmod +x port_script.sh
+          # Запускаем скрипт, передавая пути
+          ./port_script.sh $(pwd)/workspace/base $(pwd)/workspace/port
+
+      - name: Zip & Upload
+        run: |
+          cd workspace/base
+          # Создаем ZIP из готовой папки Base (куда скрипт всё собрал)
+          zip -r9 ../../${{ inputs.rom_name }}.zip .
+          cd ../..
+          
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.rom_name }}
+          path: ${{ inputs.rom_name }}.zip

@@ -1,23 +1,23 @@
-name: Port ROM for Poco F3 (Based on Video)
+name: Port ROM for Poco F3 (Alioth)
 
 on:
   workflow_dispatch:
     inputs:
       base_url:
-        description: 'URL Базовой прошивки (MIUI/HyperOS Alioth)'
+        description: 'URL Базовой прошивки (Stock ROM for Alioth)'
         required: true
       port_url:
         description: 'URL Портируемой прошивки (Donor ROM)'
         required: true
       rom_name:
-        description: 'Имя архива'
+        description: 'Имя выходного архива'
         default: 'HyperOS_Port_Alioth'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Cleanup Disk Space
@@ -31,76 +31,95 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - name: Install Tools
+      - name: Install Tools & Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y git aria2 python3 python3-pip zip unzip p7zip-full tar zstd
-          # Установка инструментов для работы с образами (payload dumper, erofs, etc)
+          
+          # Установка erofs-utils для работы с образами HyperOS
+          sudo apt-get install -y erofs-utils
+          
+          # Установка зависимостей для payload dumper
           pip3 install --upgrade pip
           pip3 install protobuf==3.20.*
           
-          # Установка payload-dumper-go
+          # Установка payload-dumper-go (быстрая распаковка)
           wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
           tar -xvf payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          chmod +x payload-dumper-go
           sudo mv payload-dumper-go /usr/local/bin/
-          
-          # Установка erofs-utils (для HyperOS/новых MIUI)
-          sudo apt-get install -y erofs-utils
 
-- name: Download & Extract ROMs
+      - name: Download & Extract ROMs (Fixed)
         run: |
+          # 1. Создаем структуру папок (ВАЖНО: workspace должна существовать до запуска дампера)
           mkdir -p input/base input/port
-          # Создаем папки для выходных файлов заранее!
           mkdir -p workspace/base workspace/port
           
-          echo "Downloading Base..."
+          # 2. Скачивание
+          echo "Downloading Base ROM..."
           aria2c -x16 -s16 -d input/base -o base.zip "${{ inputs.base_url }}"
           
-          echo "Downloading Port..."
+          echo "Downloading Port ROM..."
           aria2c -x16 -s16 -d input/port -o port.zip "${{ inputs.port_url }}"
           
-          # Распаковка Base
-          echo "Extracting Base..."
-          unzip input/base/base.zip -d input/base/
+          # 3. Распаковка BASE
+          echo "Extracting Base ZIP..."
+          unzip input/base/base.zip -d input/base/temp/
           
-          if [ -f input/base/payload.bin ]; then
-            echo "Payload found. Dumping..."
-            # Папка workspace/base уже создана выше, ошибок быть не должно
-            payload-dumper-go -o workspace/base input/base/payload.bin
+          # Поиск и распаковка payload.bin для Base
+          if [ -f input/base/temp/payload.bin ]; then
+            echo "Payload found in Base. Dumping..."
+            payload-dumper-go -o workspace/base input/base/temp/payload.bin
+          elif [ -f input/base/temp/images/system.img ]; then
+            # Fastboot ROM structure
+            echo "Fastboot ROM detected. Moving images..."
+            mv input/base/temp/images/* workspace/base/
           else
-            echo "No payload.bin found. Trying manual unzip/extraction logic..."
-            # Если это не payload.bin, просто перемещаем распакованное
-            cp -r input/base/* workspace/base/ || true
+            echo "Payload not found directly. Attempting to move all extracted files..."
+            cp -r input/base/temp/* workspace/base/ || true
           fi
 
-          # Распаковка Port
-          echo "Extracting Port..."
-          unzip input/port/port.zip -d input/port/
+          # 4. Распаковка PORT
+          echo "Extracting Port ZIP..."
+          unzip input/port/port.zip -d input/port/temp/
           
-          if [ -f input/port/payload.bin ]; then
-            echo "Payload found. Dumping..."
-            payload-dumper-go -o workspace/port input/port/payload.bin
+          # Поиск и распаковка payload.bin для Port
+          if [ -f input/port/temp/payload.bin ]; then
+            echo "Payload found in Port. Dumping..."
+            payload-dumper-go -o workspace/port input/port/temp/payload.bin
           else
-             # Если это старый формат (sparse images), возможно придется добавить логику
-             # но для большинства современных ROM нужен payload dumper
-             cp -r input/port/* workspace/port/ || true
+            echo "Payload not found in Port. Moving files..."
+            cp -r input/port/temp/* workspace/port/ || true
           fi
-          
+
       - name: Run Porting Script
         run: |
+          # Проверяем наличие скрипта
+          if [ ! -f port_script.sh ]; then
+            echo "Error: port_script.sh not found in repository!"
+            exit 1
+          fi
+          
           chmod +x port_script.sh
-          # Запускаем скрипт, передавая пути
+          
+          # Запускаем скрипт
+          # $1 = Путь к распакованной базе
+          # $2 = Путь к распакованному порту
           ./port_script.sh $(pwd)/workspace/base $(pwd)/workspace/port
 
-      - name: Zip & Upload
+      - name: Compress Output
         run: |
+          echo "Zipping the result..."
           cd workspace/base
-          # Создаем ZIP из готовой папки Base (куда скрипт всё собрал)
+          # Создаем архив без сжатия (уровень 1) для скорости, или 9 для размера
+          # Используем zip -r
           zip -r9 ../../${{ inputs.rom_name }}.zip .
           cd ../..
-          
+          ls -lh ${{ inputs.rom_name }}.zip
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.rom_name }}
           path: ${{ inputs.rom_name }}.zip
+          compression-level: 0 # Уже сжато zip-ом, экономим время на upload

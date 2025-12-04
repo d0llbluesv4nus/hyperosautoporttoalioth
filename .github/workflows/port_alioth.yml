@@ -47,9 +47,11 @@ jobs:
           # Установка erofs-utils (для HyperOS/новых MIUI)
           sudo apt-get install -y erofs-utils
 
-      - name: Download & Extract ROMs
+- name: Download & Extract ROMs
         run: |
           mkdir -p input/base input/port
+          # Создаем папки для выходных файлов заранее!
+          mkdir -p workspace/base workspace/port
           
           echo "Downloading Base..."
           aria2c -x16 -s16 -d input/base -o base.zip "${{ inputs.base_url }}"
@@ -60,20 +62,30 @@ jobs:
           # Распаковка Base
           echo "Extracting Base..."
           unzip input/base/base.zip -d input/base/
+          
           if [ -f input/base/payload.bin ]; then
+            echo "Payload found. Dumping..."
+            # Папка workspace/base уже создана выше, ошибок быть не должно
             payload-dumper-go -o workspace/base input/base/payload.bin
           else
-            echo "Support currently for Recovery ROMs (payload.bin) mainly. Trying manual unzip..."
-            unzip input/base/base.zip -d workspace/base
+            echo "No payload.bin found. Trying manual unzip/extraction logic..."
+            # Если это не payload.bin, просто перемещаем распакованное
+            cp -r input/base/* workspace/base/ || true
           fi
 
           # Распаковка Port
           echo "Extracting Port..."
           unzip input/port/port.zip -d input/port/
+          
           if [ -f input/port/payload.bin ]; then
+            echo "Payload found. Dumping..."
             payload-dumper-go -o workspace/port input/port/payload.bin
+          else
+             # Если это старый формат (sparse images), возможно придется добавить логику
+             # но для большинства современных ROM нужен payload dumper
+             cp -r input/port/* workspace/port/ || true
           fi
-
+          
       - name: Run Porting Script
         run: |
           chmod +x port_script.sh

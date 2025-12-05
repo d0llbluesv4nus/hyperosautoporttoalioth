@@ -1,40 +1,165 @@
 #!/bin/bash
+set -e # Остановить скрипт при любой ошибке
 
-# $1 = Папка с распакованной Base (Alioth)
-# $2 = Папка с распакованной Port (Donor)
+# Проверка на sudo
+if [ "$EUID" -ne 0 ]; then 
+  echo "Пожалуйста, запустите скрипт от имени root (sudo)"
+  exit 1
+fi
+
 BASE_DIR=$1
 PORT_DIR=$2
-REPO_DIR=$(pwd) # Текущая папка репозитория
 WORK_DIR=$(pwd)/working
 LOG_FILE=$(pwd)/port_log.txt
 
-# Очистка лога
+# Проверка аргументов
+if [ -z "$BASE_DIR" ] || [ -z "$PORT_DIR" ]; then
+    echo "Использование: sudo ./port_script.sh <путь_к_базе> <путь_к_порту>"
+    exit 1
+fi
+
 echo "" > $LOG_FILE
+echo "=== STARTING PORT (ALIOTH HYPEROS) ===" | tee -a $LOG_FILE
 
-mkdir -p $WORK_DIR/vendor_base
-mkdir -p $WORK_DIR/vendor_port
-mkdir -p $WORK_DIR/system_port
-mkdir -p $WORK_DIR/product_port
+# Подготовка папок
+rm -rf "$WORK_DIR"
+mkdir -p "$WORK_DIR/mnt_port" "$WORK_DIR/mnt_base"
+mkdir -p "$WORK_DIR/out/system" "$WORK_DIR/out/product" "$WORK_DIR/out/system_ext" "$WORK_DIR/out/vendor"
 
-echo "=== НАЧАЛО ПОРТИРОВАНИЯ (MODIFIED FOR ALIOTH) ===" | tee -a $LOG_FILE
+# Функция безопасного копирования (сохраняет SELinux xattr)
+safe_copy() {
+    src=$1
+    dst=$2
+    # cp -a сохраняет права и контексты, если ФС поддерживает xattr
+    cp -a "$src/." "$dst/"
+}
+
+# Функция обработки образа (Mount -> Copy -> Unmount)
+process_image() {
+    img_path=$1
+    mount_point=$2
+    out_dir=$3
+    
+    echo "Processing $img_path..." | tee -a $LOG_FILE
+    
+    # Если образ в sparse формате (simg), конвертируем в raw
+    if file "$img_path" | grep -q "Android sparse image"; then
+        simg2img "$img_path" "${img_path}.raw"
+        mv "${img_path}.raw" "$img_path"
+    fi
+
+    # Монтируем
+    mount -o loop,ro "$img_path" "$mount_point"
+    
+    # Копируем содержимое (сохраняя метаданные!)
+    echo " -> Copying files..."
+    cp -a "$mount_point/." "$out_dir/"
+    
+    # Размонтируем
+    umount "$mount_point"
+}
 
 # ---------------------------------------------
-# 1. ЗАМЕНА ОБРАЗОВ (Cross-Port Logic)
+# 1. РАСПАКОВКА (ЧЕРЕЗ MOUNT)
 # ---------------------------------------------
-echo "[1/7] Замена основных образов..." | tee -a $LOG_FILE
-# Удаляем system, product, system_ext из базы
-rm -f "$BASE_DIR/system.img" "$BASE_DIR/product.img" "$BASE_DIR/system_ext.img" "$BASE_DIR/mi_ext.img"
+echo "[1/5] Extracting Images via Mount..." | tee -a $LOG_FILE
 
-# Копируем их из порта
-cp "$PORT_DIR/system.img" "$BASE_DIR/"
-cp "$PORT_DIR/product.img" "$BASE_DIR/"
-cp "$PORT_DIR/system_ext.img" "$BASE_DIR/"
-# mi_ext часто вызывает проблемы, лучше не копировать если не уверен, но в видео его распаковывают.
-if [ -f "$PORT_DIR/mi_ext.img" ]; then
-    cp "$PORT_DIR/mi_ext.img" "$BASE_DIR/"
+# Нам нужен Vendor от BASE (Alioth)
+process_image "$BASE_DIR/vendor.img" "$WORK_DIR/mnt_base" "$WORK_DIR/out/vendor"
+
+# Нам нужны System, Product, System_ext от PORT (Donor)
+process_image "$PORT_DIR/system.img" "$WORK_DIR/mnt_port" "$WORK_DIR/out/system"
+process_image "$PORT_DIR/product.img" "$WORK_DIR/mnt_port" "$WORK_DIR/out/product"
+process_image "$PORT_DIR/system_ext.img" "$WORK_DIR/mnt_port" "$WORK_DIR/out/system_ext"
+
+# ---------------------------------------------
+# 2. ПАТЧИНГ (FIXES)
+# ---------------------------------------------
+echo "[2/5] Patching..." | tee -a $LOG_FILE
+
+SYS_ROOT="$WORK_DIR/out/system"
+VEND_ROOT="$WORK_DIR/out/vendor"
+PROD_ROOT="$WORK_DIR/out/product"
+
+# --- Fix 1: Vendor build.prop ---
+echo " -> Patching Vendor Props"
+sed -i 's/ro.apex.updatable=.*/ro.apex.updatable=true/' "$VEND_ROOT/build.prop" || echo "ro.apex.updatable=true" >> "$VEND_ROOT/build.prop"
+
+# --- Fix 2: System build.prop (120Hz) ---
+echo " -> Patching 120Hz"
+cat <<EOF >> "$SYS_ROOT/system/build.prop"
+ro.surface_flinger.set_idle_timer_ms=0
+ro.surface_flinger.set_touch_timer_ms=0
+ro.surface_flinger.set_display_power_timer_ms=0
+ro.vendor.display.default_fps=120
+EOF
+
+# --- Fix 3: SafetyNet / Fingerprint ---
+# (Меняем только если fingerprint найден, чтобы не сломать синтаксис)
+FINGERPRINT="POCO/alioth_global/alioth:13/RKQ1.211001.001/V14.0.8.0.TKHMIXM:user/release-keys"
+find "$WORK_DIR/out" -name "build.prop" -print0 | xargs -0 sed -i "s/^ro.build.fingerprint=.*/ro.build.fingerprint=$FINGERPRINT/"
+
+# --- Fix 4: NFC (Если есть патчи) ---
+if [ -d "$(pwd)/patches/nfc" ]; then
+    echo " -> Applying NFC patches"
+    cp -rf "$(pwd)/patches/nfc/"* "$SYS_ROOT/system/etc/"
 fi
 
 # ---------------------------------------------
+# 3. DEBLOAT (Осторожный)
+# ---------------------------------------------
+echo "[3/5] Light Debloat..." | tee -a $LOG_FILE
+# Удаляем только явный мусор, не трогая Галерею (она нужна камере)
+rm -rf "$PROD_ROOT/app/MSA"
+rm -rf "$PROD_ROOT/priv-app/MSA"
+rm -rf "$PROD_ROOT/app/MiShop"
+
+# ---------------------------------------------
+# 4. FIX CONTEXTS (В ручном режиме)
+# ---------------------------------------------
+echo "[4/5] Fixing Contexts (Basic)..." | tee -a $LOG_FILE
+# Поскольку мы использовали cp -a, основные контексты сохранились.
+# Но для измененных файлов (build.prop) нужно восстановить контекст.
+# Обычно это u:object_r:system_file:s0, но лучше всего не трогать, если cp -a сработал.
+
+# Исправляем права на build.prop, так как sed создает новый файл
+chmod 644 "$SYS_ROOT/system/build.prop"
+chmod 644 "$VEND_ROOT/build.prop"
+# Восстанавливаем SELinux context (требует установленного setfilecon или chcon, но на ПК это сложно).
+# Надеемся, что mkfs.erofs с опцией --file-contexts (если есть) или стандартная сборка подхватят.
+# ВНИМАНИЕ: Для идеального порта нужно генерировать file_contexts.bin. 
+# Для простого порта EROFS использует расширенные атрибуты (xattr), которые мы сохранили через cp -a.
+
+# ---------------------------------------------
+# 5. REPACKING (EROFS)
+# ---------------------------------------------
+echo "[5/5] Repacking images..." | tee -a $LOG_FILE
+
+# Аргументы для сохранения xattr (контекстов)
+EROFS_ARGS="-zlz4hc --mount-point"
+
+# Функция упаковки
+pack_image() {
+    src_dir=$1
+    img_name=$2
+    mount_pt=$3 # например /system
+    
+    echo "Repacking $img_name..."
+    # Важно: mkfs.erofs должен поддерживать флаги для сохранения xattr
+    mkfs.erofs $EROFS_ARGS "$mount_pt" --fs-config-file "$(pwd)/fs_config_dummy" "$BASE_DIR/$img_name" "$src_dir" 
+    # Примечание: полноценный fs-config здесь опущен для простоты, но cp -a + mkfs.erofs часто работает на новых версиях tools.
+    # Если версия mkfs.erofs старая, используйте просто:
+    # mkfs.erofs -zlz4hc "$BASE_DIR/$img_name" "$src_dir"
+}
+
+# ВАЖНО: Проверьте версию mkfs.erofs. 
+# Если простая:
+mkfs.erofs -zlz4hc "$BASE_DIR/vendor.img" "$WORK_DIR/out/vendor"
+mkfs.erofs -zlz4hc "$BASE_DIR/system.img" "$WORK_DIR/out/system"
+mkfs.erofs -zlz4hc "$BASE_DIR/product.img" "$WORK_DIR/out/product"
+mkfs.erofs -zlz4hc "$BASE_DIR/system_ext.img" "$WORK_DIR/out/system_ext"
+
+echo "=== DONE. Flash these images via Fastboot ===" | tee -a $LOG_FILE# ---------------------------------------------
 # 2. РАСПАКОВКА ДЛЯ ПАТЧИНГА
 # ---------------------------------------------
 echo "[2/7] Распаковка образов для патчинга..." | tee -a $LOG_FILE

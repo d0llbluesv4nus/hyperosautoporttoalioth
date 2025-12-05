@@ -4,22 +4,25 @@ on:
   workflow_dispatch:
     inputs:
       base_url:
-        description: 'URL Базовой прошивки (Stock ROM for Alioth)'
+        description: 'Ссылка на базовую прошивку (Alioth - Fastboot/Recovery)'
         required: true
       port_url:
-        description: 'URL Портируемой прошивки (Donor ROM)'
+        description: 'Ссылка на порт-прошивку (Donor - Recovery/Fastboot)'
         required: true
       rom_name:
-        description: 'Имя выходного архива'
+        description: 'Имя выходного файла (без расширения)'
         default: 'HyperOS_Port_Alioth'
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    
     steps:
+      # 1. Клонирование репозитория
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # 2. Очистка места (КРИТИЧНО ВАЖНО для Android портов)
       - name: Cleanup Disk Space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -31,80 +34,101 @@ jobs:
           docker-images: true
           swap-storage: true
 
+      # 3. Установка зависимостей и инструментов
       - name: Install Tools & Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git aria2 python3 python3-pip zip unzip p7zip-full tar zstd brotli
+          sudo apt-get install -y git aria2 python3 python3-pip zip unzip p7zip-full tar zstd
           
-          # Установка erofs-utils
+          # Установка EROFS Utils (для HyperOS)
           sudo apt-get install -y erofs-utils
           
-          # Установка payload-dumper-go
+          # Создаем папку для бинарников
+          mkdir -p bin
+          
+          # --- Payload Dumper (для Recovery ROM) ---
           wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
           tar -xvf payload-dumper-go_1.2.2_linux_amd64.tar.gz
-          chmod +x payload-dumper-go
-          sudo mv payload-dumper-go /usr/local/bin/
+          mv payload-dumper-go bin/
+          
+          # --- Android OTA Tools (lpunpack, lpmake, img2sdat) ---
+          # Скачиваем готовые бинарники, так как компилировать долго
+          wget https://github.com/toraidl/android_tools/raw/main/linux/lpunpack -O bin/lpunpack
+          wget https://github.com/toraidl/android_tools/raw/main/linux/lpmake -O bin/lpmake
+          wget https://github.com/toraidl/android_tools/raw/main/linux/simg2img -O bin/simg2img
+          
+          # Даем права на выполнение
+          chmod +x bin/*
+          
+          # Добавляем bin в PATH для текущей сессии
+          echo "$(pwd)/bin" >> $GITHUB_PATH
 
-      - name: Download & Extract ROMs
+      # 4. Скачивание прошивок
+      - name: Download ROMs
         run: |
           mkdir -p input/base input/port
-          mkdir -p workspace/base workspace/port
           
-          # --- СКАЧИВАНИЕ ---
-          echo "Downloading Base ROM..."
+          echo ">>> Downloading Base ROM..."
           aria2c -x16 -s16 -d input/base -o base_rom "${{ inputs.base_url }}"
           
-          echo "Downloading Port ROM..."
+          echo ">>> Downloading Port ROM..."
           aria2c -x16 -s16 -d input/port -o port_rom "${{ inputs.port_url }}"
-          
-          # --- РАСПАКОВКА BASE ---
-          echo "Extracting Base..."
-          cd input/base
-          # Проверяем, это zip или tgz/tar.gz
-          if file base_rom | grep -q "Zip archive"; then
-              mv base_rom base.zip
-              unzip base.zip -d temp/
-          elif file base_rom | grep -q "gzip compressed"; then
-              mv base_rom base.tgz
-              tar -xzvf base.tgz -C temp/
-          else
-              echo "Unknown format for Base ROM"
-              exit 1
-          fi
-          cd ../..
-          
-          # Ищем payload или images в Base
-          if [ -f input/base/temp/payload.bin ]; then
-              payload-dumper-go -o workspace/base input/base/temp/payload.bin
-          elif [ -n "$(find input/base/temp -name 'system.img')" ]; then
-              echo "Images found directly (Fastboot ROM)"
-              find input/base/temp -name '*.img' -exec mv {} workspace/base/ \;
-          else
-              # Если структура сложная, копируем всё
-              cp -r input/base/temp/* workspace/base/
-          fi
 
-          # --- РАСПАКОВКА PORT ---
-          echo "Extracting Port..."
-          cd input/port
-          if file port_rom | grep -q "Zip archive"; then
-              mv port_rom port.zip
-              unzip port.zip -d temp/
-          elif file port_rom | grep -q "gzip compressed"; then
-              mv port_rom port.tgz
-              tar -xzvf port.tgz -C temp/
-          fi
-          cd ../..
+      # 5. Распаковка (Универсальная логика)
+      - name: Extract ROMs
+        run: |
+          mkdir -p workspace/base workspace/port
           
-          # Ищем payload в Port
-          if [ -f input/port/temp/payload.bin ]; then
-              payload-dumper-go -o workspace/port input/port/temp/payload.bin
-          else
-               # Если payload нет, пробуем найти images
-              find input/port/temp -name '*.img' -exec mv {} workspace/port/ \;
-          fi
+          # --- ФУНКЦИЯ РАСПАКОВКИ ---
+          extract_rom() {
+            type=$1   # base или port
+            input_file="input/$type/${type}_rom"
+            out_dir="workspace/$type"
+            temp_dir="input/$type/temp"
+            mkdir -p "$temp_dir"
+            
+            echo ">>> Extracting $type..."
+            
+            # 1. Распаковка архива (Zip/Tgz)
+            if file "$input_file" | grep -q "Zip archive"; then
+                unzip "$input_file" -d "$temp_dir"
+            elif file "$input_file" | grep -q "gzip compressed"; then
+                tar -xzvf "$input_file" -C "$temp_dir"
+            else
+                echo "Unknown format for $type"
+                exit 1
+            fi
+            
+            # 2. Поиск payload.bin (Recovery ROM)
+            if [ -f "$temp_dir/payload.bin" ]; then
+                echo "Found payload.bin, dumping..."
+                payload-dumper-go -o "$out_dir" "$temp_dir/payload.bin"
+            
+            # 3. Поиск super.img (Fastboot ROM)
+            elif [ -n "$(find "$temp_dir" -name 'super.img')" ]; then
+                echo "Found super.img, unpacking..."
+                find "$temp_dir" -name 'super.img' -exec lpunpack {} "$out_dir" \;
+            
+            # 4. Поиск отдельных images (Sparse Fastboot)
+            elif [ -n "$(find "$temp_dir" -name 'system.img')" ]; then
+                echo "Found raw images..."
+                find "$temp_dir" -name '*.img' -exec mv {} "$out_dir/" \;
+            else
+                # Пробуем найти super.img внутри вложенных папок/архивов (для tgz)
+                 find "$temp_dir" -name 'super.img' -exec lpunpack {} "$out_dir" \;
+            fi
+            
+            # Очистка временных файлов для экономии места
+            rm -rf "$temp_dir"
+            rm -f "$input_file"
+          }
+          
+          # Запуск функции для обоих образов
+          extract_rom "base"
+          extract_rom "port"
 
-      - name: Run Porting Script (ROOT)
+      # 6. Запуск скрипта портирования
+      - name: Run Porting Script
         run: |
           if [ ! -f port_script.sh ]; then
             echo "Error: port_script.sh not found!"
@@ -113,39 +137,37 @@ jobs:
           
           chmod +x port_script.sh
           
-          # !!! ВАЖНО: ЗАПУСК ЧЕРЕЗ SUDO !!!
-          # Скрипт должен уметь работать с правами root для mount
-          sudo ./port_script.sh $(pwd)/workspace/base $(pwd)/workspace/port
+          # Передаем пути и запускаем под sudo (нужно для mount EROFS)
+          # Используем $(pwd) чтобы передать абсолютные пути
+          sudo env PATH=$PATH:$(pwd)/bin ./port_script.sh $(pwd)/workspace/base $(pwd)/workspace/port
 
-      - name: Prepare Output Structure
+      # 7. Подготовка выходного файла
+      - name: Compress & Upload
         run: |
-          mkdir -p final_rom
-          # Если скрипт (мой исправленный) кладет итог в working/out:
-          if [ -d "working/out" ]; then
-             cp -r working/out/* final_rom/
-             # Копируем boot.img и прочее из базы, если их нет в out
-             if [ ! -f final_rom/boot.img ]; then cp workspace/base/boot.img final_rom/ 2>/dev/null || true; fi
-             if [ ! -f final_rom/dtbo.img ]; then cp workspace/base/dtbo.img final_rom/ 2>/dev/null || true; fi
-             if [ ! -f final_rom/vbmeta.img ]; then cp workspace/base/vbmeta.img final_rom/ 2>/dev/null || true; fi
-          else
-             # Если скрипт менял файлы "на месте" в workspace/base
-             cp -r workspace/base/* final_rom/
-          fi
-
-      - name: Compress Output
-        run: |
-          cd final_rom
-          # Удаляем лишние тяжелые файлы, если они не нужны для прошивки (например, исходные system.img.raw если остались)
-          rm -f *.raw
+          mkdir -p out
           
-          echo "Zipping final ROM..."
+          # Если скрипт создал super.img (идеальный вариант)
+          if [ -f "working/super.img" ]; then
+            mv working/super.img out/
+          # Если скрипт создал отдельные образы
+          elif [ -d "working/out" ]; then
+            mv working/out/*.img out/
+          else
+             echo "No output images found!"
+             exit 1
+          fi
+          
+          # Добавляем boot.img из базы (нужен для загрузки)
+          # Ищем boot.img в workspace/base
+          find workspace/base -name "boot.img" -exec cp {} out/ \;
+          
+          # Архивируем
+          cd out
           zip -r9 ../${{ inputs.rom_name }}.zip .
           cd ..
-          ls -lh ${{ inputs.rom_name }}.zip
-
+          
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.rom_name }}
           path: ${{ inputs.rom_name }}.zip
-          compression-level: 0
